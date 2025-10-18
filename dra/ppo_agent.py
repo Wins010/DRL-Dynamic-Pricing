@@ -1,20 +1,17 @@
-# dra/ppo_agent.py
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim, act_dim):
         super(ActorCritic, self).__init__()
-        self.actor = nn.Sequential(
+        self.actor_mean = nn.Sequential(
             nn.Linear(obs_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, act_dim),
-            nn.Softmax(dim=-1)
+            nn.Linear(64, act_dim)
         )
+        self.actor_log_std = nn.Parameter(torch.zeros(act_dim))  # learnable std dev
 
         self.critic = nn.Sequential(
             nn.Linear(obs_dim, 64),
@@ -23,10 +20,10 @@ class ActorCritic(nn.Module):
         )
 
     def forward(self, x):
-        action_probs = self.actor(x)
+        mean = self.actor_mean(x)
+        std = torch.exp(self.actor_log_std)
         state_value = self.critic(x)
-        return action_probs, state_value
-
+        return mean, std, state_value
 
 class PPOAgent:
     def __init__(self, obs_dim, act_dim, lr=3e-4, gamma=0.99, eps_clip=0.2, k_epochs=10):
@@ -35,19 +32,47 @@ class PPOAgent:
         self.k_epochs = k_epochs
 
         self.policy = ActorCritic(obs_dim, act_dim)
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         self.policy_old = ActorCritic(obs_dim, act_dim)
         self.policy_old.load_state_dict(self.policy.state_dict())
 
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         self.MseLoss = nn.MSELoss()
+
+        # Memory buffer
+        self.memory = {
+            "states": [],
+            "actions": [],
+            "logprobs": [],
+            "rewards": [],
+            "dones": [],
+            "values": []
+        }
 
     def select_action(self, obs):
         obs = torch.FloatTensor(obs).unsqueeze(0)
         with torch.no_grad():
-            action_probs, _ = self.policy_old(obs)
-        dist = torch.distributions.Categorical(action_probs)
+            mean, std, value = self.policy_old(obs)
+        dist = torch.distributions.Normal(mean, std)
         action = dist.sample()
-        return action.item(), dist.log_prob(action).item()
+        logprob = dist.log_prob(action).sum(dim=-1)  # sum across dims
+
+        return action.squeeze().numpy(), logprob.item()
+
+    def store_transition(self, state, action, logprob, reward, done):
+        state_tensor = torch.tensor(state, dtype=torch.float32)
+        with torch.no_grad():
+            mean, std, value = self.policy_old(state_tensor.unsqueeze(0))
+
+        self.memory["states"].append(state_tensor)
+        self.memory["actions"].append(torch.tensor(action, dtype=torch.float32))
+        self.memory["logprobs"].append(logprob)
+        self.memory["rewards"].append(reward)
+        self.memory["dones"].append(done)
+        self.memory["values"].append(value.squeeze())
+
+    def clear_memory(self):
+        for key in self.memory:
+            self.memory[key] = []
 
     def compute_returns(self, rewards, dones, values, next_value):
         returns = []
@@ -59,26 +84,32 @@ class PPOAgent:
         values = torch.stack(values)
         return returns, values
 
-    def update(self, memory):
-        old_states = torch.FloatTensor(np.array(memory["states"]))
-        old_actions = torch.LongTensor(np.array(memory["actions"]))
+    def update(self, memory=None):
+        if memory is None:
+            memory = self.memory
+
+        old_states = torch.stack(memory["states"])
+        old_actions = torch.stack(memory["actions"])
         old_logprobs = torch.FloatTensor(np.array(memory["logprobs"]))
         rewards = memory["rewards"]
         dones = memory["dones"]
 
         with torch.no_grad():
-            _, next_value = self.policy(old_states[-1].unsqueeze(0))
+            mean, std, next_value = self.policy(old_states[-1].unsqueeze(0))
         returns, values = self.compute_returns(rewards, dones, memory["values"], next_value)
 
-        for _ in range(self.k_epochs):
-            action_probs, state_values = self.policy(old_states)
-            dist = torch.distributions.Categorical(action_probs)
-            entropy = dist.entropy().mean()
+        # Compute normalized advantage
+        advantages = returns - values.detach().squeeze()
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            logprobs = dist.log_prob(old_actions)
+        for epoch in range(self.k_epochs):
+            mean, std, state_values = self.policy(old_states)
+            dist = torch.distributions.Normal(mean, std)
+            entropy = dist.entropy().sum(dim=-1).mean()
+
+            logprobs = dist.log_prob(old_actions).sum(dim=-1)
             ratios = torch.exp(logprobs - old_logprobs)
 
-            advantages = returns - state_values.detach().squeeze()
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
             actor_loss = -torch.min(surr1, surr2).mean()
@@ -89,4 +120,13 @@ class PPOAgent:
             loss.backward()
             self.optimizer.step()
 
+            print(f"[PPO Update] Epoch {epoch+1}/{self.k_epochs} "
+                  f"actor_loss={actor_loss.item():.4f}, "
+                  f"critic_loss={critic_loss.item():.4f}, "
+                  f"entropy={entropy.item():.4f}")
+
         self.policy_old.load_state_dict(self.policy.state_dict())
+
+    def train(self):
+        self.update(self.memory)
+        self.clear_memory()

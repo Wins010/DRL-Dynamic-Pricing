@@ -1,11 +1,10 @@
-# env/dr_env.py
-
 import numpy as np
 import pandas as pd
 import os
 
 from hems.residential_agent import ResidentialAgent
 from models.thermal_model import ThermalModel
+
 
 class DemandResponseEnv:
     def __init__(self, data_path, episode_length=96):
@@ -73,7 +72,11 @@ class DemandResponseEnv:
         rewards = []
 
         for i, agent in enumerate(self.agents):
-            price = price_signal if np.isscalar(price_signal) else price_signal[i]
+            if np.isscalar(price_signal) or np.ndim(price_signal) == 0:
+                price = price_signal
+            else:
+                price = price_signal[i]
+
             power = agent.decide_heating(price)
             agent.update_temperature(
                 outdoor_temp=self.outdoor_temps[i, self.current_step],
@@ -82,16 +85,49 @@ class DemandResponseEnv:
             total = power + self.fixed_loads[i, self.current_step]
             total_load.append(total)
 
-            # Reward: simple comfort metric (optional: add price penalty)
+            # Reward = weighted combination of comfort and energy cost
             comfort_penalty = max(0, agent.setpoint_temp - agent.indoor_temp)
-            rewards.append(-comfort_penalty)  # More negative = worse comfort
+            price_penalty = price * power  # power is what the agent decided to consume
 
-        self.current_step += 1
-        done = self.current_step >= self.episode_length
+            reward = -comfort_penalty - 0.1 * price_penalty
+            rewards.append(reward)
+
+        self.last_powers = [agent.last_power for agent in self.agents]
+        self.last_rewards = rewards
+
         obs = self._get_observation()
+        self.current_step += 1
+        done = self.current_step >= min(self.outdoor_temps.shape[1], self.episode_length)
 
-        return obs, np.mean(rewards), done, {"total_load": np.sum(total_load)}
+        return obs, np.mean(rewards), done, {
+            "price": np.mean(price_signal) if not np.isscalar(price_signal) else price_signal,
+            "total_power": float(np.sum([a.last_power for a in self.agents])),
+            "avg_indoor_temp": float(np.mean([a.indoor_temp for a in self.agents]))
+        }
 
     def render(self):
         temps = [round(agent.indoor_temp, 1) for agent in self.agents]
         print(f"Step {self.current_step}: Indoor temps = {temps}")
+        print(f"Powers: {self.last_powers}")
+        print(f"Step rewards: {self.last_rewards}")
+
+
+# For standalone testing
+if __name__ == "__main__":
+    import os
+
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_path = os.path.join(base_dir, "data", "synthetic")
+
+    print("Using data path:", data_path)
+
+    env = DemandResponseEnv(data_path=data_path)
+    obs = env.reset()
+    print("Initial Observation:", obs)
+
+    done = False
+    while not done:
+        price = 0.5  # test price signal
+        obs, reward, done, info = env.step(price)
+        env.render()
+        print(f"Reward: {reward}, Info: {info}")
