@@ -110,6 +110,20 @@ class DemandResponseEnv:
         print(f"Step {self.current_step}: Indoor temps = {temps}")
         print(f"Powers: {self.last_powers}")
         print(f"Step rewards: {self.last_rewards}")
+    def price_generator(self, aggregate_demand, eta, M, pi_min=0.05, pi_max=0.25):
+        """
+        Generate price profile for the episode using the sigmoid function.
+        aggregate_demand: array-like, shape (T,)
+        eta: price change rate parameter (output of PPO agent)
+        M: system capacity limit (scalar)
+        pi_min, pi_max: float, lower and upper bounds for price
+        Returns: price_profile (shape T,)
+        """
+        aggregate_demand = np.asarray(aggregate_demand)
+        # Avoid division by zero or extremely small eta
+        eta = max(1e-4, abs(eta))
+        price_profile = pi_min + (pi_max - pi_min) / (1 + np.exp(-(aggregate_demand - M) / eta))
+        return price_profile
 
 
 # For standalone testing
