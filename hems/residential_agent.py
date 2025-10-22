@@ -50,3 +50,46 @@ class ResidentialAgent:
             # If solver fails, fallback to no heating
             return np.zeros(T)
         return np.clip(u.value, 0, self.max_power)
+
+    def run_episode(self, eta, max_iter=10, tol=1e-3):
+        """
+        Coordination loop for a full episode as in the research paper.
+        Args:
+            eta: parameter for price generator (output of PPO agent)
+            max_iter: max coordination iterations per episode
+            tol: convergence threshold for aggregate demand
+        Returns:
+            reward: episode-level reward (for PPO)
+            episode_stats: dict with price profile, demand, diagnostics
+        """
+        self.reset()
+        n_steps = self.episode_length
+        n_agents = len(self.agents)
+        # Initial guess for aggregate demand (flat, zeros)
+        agg_demand = np.zeros(n_steps)
+        prev_agg_demand = np.ones(n_steps) * np.inf
+
+        for it in range(max_iter):
+            price_profile = self.price_generator(agg_demand, eta)
+            all_schedules = []
+            for i, agent in enumerate(self.agents):
+                schedule = agent.optimize_schedule(
+                    price_profile=price_profile,
+                    outdoor_temp=self.outdoor_temps[i],
+                    fixed_load=self.fixed_loads[i]
+                )
+                all_schedules.append(schedule)
+            agg_demand = np.sum(all_schedules, axis=0)
+            # Convergence: demand profile does not change much
+            if np.linalg.norm(agg_demand - prev_agg_demand) < tol:
+                break
+            prev_agg_demand = agg_demand.copy()
+
+        reward, diagnostics = self.compute_episode_reward(agg_demand, price_profile)
+        episode_stats = {
+            "aggregate_demand": agg_demand,
+            "price_profile": price_profile,
+            "iterations": it + 1,
+            **diagnostics
+        }
+        return reward, episode_stats
